@@ -22,27 +22,34 @@ class FeatureRecord(BaseModel):
 def health():
     return {"status": "ok"}
 
+import asyncio
+import logging
+
+logger = logging.getLogger("ingest")
+
+
+def process_one(filename: str, content: bytes) -> tuple[str, Any]:
+    """Blocking work: parse, validate, write. Runs in a worker thread."""
+    try:
+        data = json.loads(content)
+        record = FeatureRecord(**data)
+        raw_id = record.metadata["tags"]["musicbrainz_recordingid"][0]
+        recording_id = str(uuid.UUID(raw_id))
+        with open(PROCESSED_DIR / f"{recording_id}.json", "w") as f:
+            json.dump(data, f)
+        return "accepted", recording_id
+    except (json.JSONDecodeError, ValidationError, KeyError, IndexError, ValueError) as e:
+        return "rejected", {"file": filename, "error": f"invalid file: {e}"}
+    except Exception:
+        logger.exception("unexpected error processing %s", filename)  # full traceback in the server log
+        return "rejected", {"file": filename, "error": "internal error"}
+
+
 @app.post("/ingest")
 async def ingest_batch(files: List[UploadFile]):
     results = {"accepted": [], "rejected": []}
-
     for file in files:
-        try:
-            content = await file.read()
-            data = json.loads(content)
-            record = FeatureRecord(**data)
-
-            raw_id = record.metadata["tags"]["musicbrainz_recordingid"][0]
-            recording_id = str(uuid.UUID(raw_id))  # raises ValueError if not a real UUID
-
-            with open(PROCESSED_DIR / f"{recording_id}.json", "w") as f:
-                json.dump(data, f)
-
-            results["accepted"].append(recording_id)
-
-        except (json.JSONDecodeError, ValidationError, KeyError, IndexError, ValueError) as e:
-            results["rejected"].append({"file": file.filename, "error": f"invalid file: {e}"})
-        except Exception as e:
-            results["rejected"].append({"file": file.filename, "error": f"unexpected error: {e}"})
-
+        content = await file.read()
+        status, payload = await asyncio.to_thread(process_one, file.filename, content)
+        results[status].append(payload)
     return results
