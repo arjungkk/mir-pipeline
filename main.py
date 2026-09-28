@@ -45,11 +45,24 @@ def process_one(filename: str, content: bytes) -> tuple[str, Any]:
         return "rejected", {"file": filename, "error": "internal error"}
 
 
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+pool = ProcessPoolExecutor()   # defaults to one worker per CPU core
+
+# process_one stays exactly as it is, as a plain top-level function.
+
 @app.post("/ingest")
 async def ingest_batch(files: List[UploadFile]):
+    loop = asyncio.get_running_loop()
+
+    # read every upload first (I/O, cheap), then fan the work out to the pool
+    contents = [(f.filename, await f.read()) for f in files]
+    outcomes = await asyncio.gather(
+        *(loop.run_in_executor(pool, process_one, name, data) for name, data in contents)
+    )
+
     results = {"accepted": [], "rejected": []}
-    for file in files:
-        content = await file.read()
-        status, payload = await asyncio.to_thread(process_one, file.filename, content)
+    for status, payload in outcomes:
         results[status].append(payload)
     return results
