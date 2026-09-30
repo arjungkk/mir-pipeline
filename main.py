@@ -28,14 +28,14 @@ import logging
 logger = logging.getLogger("ingest")
 
 
-def process_one(filename: str, content: bytes) -> tuple[str, Any]:
+def process_one(filename: str, content: bytes, output_dir: Path = PROCESSED_DIR) -> tuple[str, Any]:
     """Blocking work: parse, validate, write. Runs in a worker thread."""
     try:
         data = json.loads(content)
         record = FeatureRecord(**data)
         raw_id = record.metadata["tags"]["musicbrainz_recordingid"][0]
         recording_id = str(uuid.UUID(raw_id))
-        with open(PROCESSED_DIR / f"{recording_id}.json", "w") as f:
+        with open(output_dir / f"{recording_id}.json", "w") as f:
             json.dump(data, f)
         return "accepted", recording_id
     except (json.JSONDecodeError, ValidationError, KeyError, IndexError, ValueError) as e:
