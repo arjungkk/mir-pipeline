@@ -1,68 +1,84 @@
-from fastapi import FastAPI, UploadFile
-from pydantic import BaseModel, ValidationError
-from typing import List, Dict, Any
+from fastapi import FastAPI, HTTPException, UploadFile
+from typing import List
 from pathlib import Path
+import redis as redis_lib
 import json
 import uuid
 
+from shared import FeatureRecord
+from tasks import process_one_task
+
 app = FastAPI()
+r = redis_lib.Redis(host='localhost', port=6379, decode_responses=True)
 
-PROCESSED_DIR = Path(__file__).parent / "processed"
-PROCESSED_DIR.mkdir(exist_ok=True)
+RESULTS_DIR = Path(__file__).parent / "results"
+RESULTS_DIR.mkdir(exist_ok=True)
 
-
-class FeatureRecord(BaseModel):
-    lowlevel: Dict[str, Any]
-    rhythm: Dict[str, Any]
-    tonal: Dict[str, Any]
-    metadata: Dict[str, Any]
+MAX_BATCH_SIZE = 500
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-import asyncio
-import logging
-
-logger = logging.getLogger("ingest")
-
-
-def process_one(filename: str, content: bytes, output_dir: Path = PROCESSED_DIR) -> tuple[str, Any]:
-    """Blocking work: parse, validate, write. Runs in a worker thread."""
-    try:
-        data = json.loads(content)
-        record = FeatureRecord(**data)
-        raw_id = record.metadata["tags"]["musicbrainz_recordingid"][0]
-        recording_id = str(uuid.UUID(raw_id))
-        with open(output_dir / f"{recording_id}.json", "w") as f:
-            json.dump(data, f)
-        return "accepted", recording_id
-    except (json.JSONDecodeError, ValidationError, KeyError, IndexError, ValueError) as e:
-        return "rejected", {"file": filename, "error": f"invalid file: {e}"}
-    except Exception:
-        logger.exception("unexpected error processing %s", filename)  # full traceback in the server log
-        return "rejected", {"file": filename, "error": "internal error"}
-
-
-import asyncio
-from concurrent.futures import ProcessPoolExecutor
-
-pool = ProcessPoolExecutor()   # defaults to one worker per CPU core
-
-# process_one stays exactly as it is, as a plain top-level function.
 
 @app.post("/ingest")
 async def ingest_batch(files: List[UploadFile]):
-    loop = asyncio.get_running_loop()
+    if len(files) > MAX_BATCH_SIZE:
+        raise HTTPException(status_code=429, detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}")
 
-    # read every upload first (I/O, cheap), then fan the work out to the pool
-    contents = [(f.filename, await f.read()) for f in files]
-    outcomes = await asyncio.gather(
-        *(loop.run_in_executor(pool, process_one, name, data) for name, data in contents)
-    )
+    batch_id = str(uuid.uuid4())
+    job_key = f"job:{batch_id}"
+    r.hset(job_key, mapping={
+        "status": "processing",
+        "total_files": len(files),
+        "processed_count": 0
+    })
 
-    results = {"accepted": [], "rejected": []}
-    for status, payload in outcomes:
-        results[status].append(payload)
-    return results
+    for file in files:
+        content = await file.read()
+        process_one_task.delay(batch_id, file.filename, content)
+
+    return {"batch_id": batch_id}
+
+
+@app.get("/jobs/{batch_id}")
+def get_job_status(batch_id: str):
+    """Get the status of a batch job."""
+    job_key = f"job:{batch_id}"
+    job_data = r.hgetall(job_key)
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    total_files = int(job_data.get("total_files", 0))
+    processed_count = int(job_data.get("processed_count", 0))
+
+    response = {
+        "batch_id": batch_id,
+        "status": job_data.get("status"),
+        "total_files": total_files,
+        "processed_count": processed_count
+    }
+
+    response["results_url"] = f"/jobs/{batch_id}/results"
+
+    return response
+
+
+@app.get("/jobs/{batch_id}/results")
+def get_job_results(batch_id: str):
+    """Get the results of a completed batch job."""
+    job_key = f"job:{batch_id}"
+    job_data = r.hgetall(job_key)
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    results_path = RESULTS_DIR / f"{batch_id}.json"
+    if not results_path.exists():
+        raise HTTPException(status_code=404, detail="Results not available yet")
+
+    with open(results_path, "r") as f:
+        results = json.load(f)
+
+    return {"batch_id": batch_id, "results": results}
+
