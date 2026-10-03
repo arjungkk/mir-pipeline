@@ -4,6 +4,7 @@ from pathlib import Path
 import redis as redis_lib
 import json
 import uuid
+import asyncio
 
 from shared import FeatureRecord
 from tasks import process_one_task
@@ -15,6 +16,10 @@ RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 MAX_BATCH_SIZE = 500
+
+def dispatch_all(batch_id: str, files_content: list[tuple[str, bytes]]):
+    for filename, content in files_content:
+        process_one_task.delay(batch_id, filename, content)
 
 
 @app.get("/health")
@@ -35,10 +40,9 @@ async def ingest_batch(files: List[UploadFile]):
         "processed_count": 0
     })
 
-    for file in files:
-        content = await file.read()
-        process_one_task.delay(batch_id, file.filename, content)
-
+    files_content = [(f.filename, await f.read()) for f in files]
+    await asyncio.to_thread(dispatch_all, batch_id, files_content)
+    
     return {"batch_id": batch_id}
 
 
