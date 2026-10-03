@@ -87,18 +87,18 @@ retrieved via separate polling endpoints.
 | Scenario | Response time | Health check during it |
 |---|---|---|
 | 500-file batch, dispatch in request loop | 1.4-1.7 s | one check up to 1.1 s |
-| 500-file batch, dispatch via `asyncio.to_thread` | 1.5-1.7 s | worst case 168 ms |
+| 500-file batch, dispatch via `asyncio.to_thread` | 1.4-1.6 s | worst case ~6 ms, several runs |
 
-The remaining ~1.5 s and occasional slow health check come from 500
-synchronous `.delay()` calls to Redis inside the dispatch loop. Moving the
-loop to a worker thread let the event loop interleave other requests, but
-some contention remains: the GIL means only one thread runs Python bytecode
-at a time, so dispatch and other requests still take turns rather than
-running simultaneously.
+The remaining ~1.5 s comes from 500 synchronous `.delay()` calls to Redis
+inside the dispatch loop. Moving the loop to a worker thread let the event
+loop interleave other requests consistently; some contention in principle
+remains because of the GIL, only one thread runs Python bytecode at a time,
+but in practice it's no longer visible at this scale.
 
 **Known next step:** Celery supports bulk/batch task dispatch, which would
 reduce this to far fewer round-trips to Redis instead of 500 individual
-calls. Not yet implemented.
+calls. Not yet implemented; flagged as a stretch goal for later in the
+project.
 
 ## Status and results endpoints
 
